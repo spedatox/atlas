@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.db
+venv/
+.claude/
+*.xlsx
+Dockerfile.windows-build

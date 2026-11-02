@@ -1,4 +1,4 @@
-# ATLAS Mark I
+# ATLAS
 ### Sunucu Envanter Sistemi — Server Inventory System
 
 > Built for OSTIM Teknik Üniversitesi infrastructure management.
@@ -7,7 +7,7 @@
 
 ## Overview
 
-**ATLAS Mark I** is a desktop application for managing Proxmox server infrastructure, NAS storage devices, and virtual machines. It provides a clean, dark-themed interface for browsing server credentials, system resources, and VM allocations — all stored locally in an encrypted SQLite database.
+**ATLAS** is a desktop application for managing Proxmox server infrastructure, NAS storage devices, and virtual machines. It provides a clean, dark-themed interface for browsing server credentials, system resources, and VM allocations — all stored locally in an encrypted SQLite database.
 
 ---
 

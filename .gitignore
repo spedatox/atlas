@@ -5,6 +5,11 @@ build/
 dist/
 *.db
 venv/
+.venv/
+backups/
+*.db-*
+*.sqlite
+*.sqlite3
 .claude/
 *.xlsx
 Dockerfile.windows-build

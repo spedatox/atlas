@@ -4,12 +4,13 @@ from PySide6.QtWidgets import (
     QFrame, QScrollArea, QPushButton, QApplication,
     QStyledItemDelegate, QSplitter, QSizePolicy,
     QStyle, QStatusBar, QAbstractItemView, QMessageBox,
-    QMenuBar, QMenu
+    QMenuBar, QMenu, QFileDialog
 )
 from PySide6.QtCore import Qt, QRect, QSize, QTimer
 from PySide6.QtGui import (QPainter, QFont, QColor, QFontMetrics,
                             QPen, QShortcut, QKeySequence, QAction)
-from database import db_manager
+from backends import db_manager
+from tasks import run_task
 
 
 # ── Custom Tree Delegate ───────────────────────────────────────────────────────
@@ -422,6 +423,12 @@ class MainWindow(QMainWindow):
         act_refresh.triggered.connect(self._load_data)
         file_menu.addAction(act_refresh)
 
+        for text, slot in (('Bellek / Envanter Yedeği Al...', self._backup_inventory),
+                           ('Envanter İçe Aktar...', self._import_inventory)):
+            action = QAction(text, self)
+            action.triggered.connect(slot)
+            file_menu.addAction(action)
+
         file_menu.addSeparator()
 
         act_exit = QAction("Çıkış", self)
@@ -451,14 +458,86 @@ class MainWindow(QMainWindow):
     # ── Data ──────────────────────────────────────────────────────────────────
 
     def _load_data(self):
-        self.inventory = db_manager.get_inventory()
+        run_task(self, 'Envanter yükleniyor...', db_manager.get_inventory,
+                 self._data_loaded, self._storage_error)
+
+    def _storage_error(self, message):
+        QMessageBox.critical(self, 'Veri İşlemi Başarısız', message)
+
+    def _data_loaded(self, inventory):
+        self.inventory = inventory
         self._populate_tree()
+        self._filter_tree(self.search.text())
+        if self._current_vm:
+            selected = next(((vm, s) for s in inventory for vm in s['vms']
+                             if vm['id'] == self._current_vm['id']), None)
+            if selected:
+                self._show_vm(*selected)
+            else:
+                self._current_vm = self._current_parent = None
+                self._show_placeholder()
+        elif self._current_server:
+            selected = next((s for s in inventory if s['id'] == self._current_server['id']), None)
+            if selected:
+                self._show_server(selected)
+            else:
+                self._current_server = None
+                self._show_placeholder()
         servers = sum(1 for s in self.inventory if s.get('type') == 'Server')
         storages = sum(1 for s in self.inventory if s.get('type') == 'Storage')
         vms = sum(len(s.get('vms', [])) for s in self.inventory)
         self._status.showMessage(
             f"  {servers} Proxmox Sunucu  ·  {storages} Depolama  ·  {vms} Sanal Makine"
+            + ('  ·  Uzak sunucu' if db_manager.mode == 'remote' else '  ·  Yerel SQLite')
         )
+
+    def _backup_inventory(self):
+        from datetime import datetime
+        filters = 'ATLAS JSON (*.json)'
+        if db_manager.mode == 'local':
+            filters += ';;Tam SQLite Yedeği (*.db)'
+        path, selected = QFileDialog.getSaveFileName(
+            self, 'Envanter Yedeği Al', f'atlas-backup-{datetime.now():%Y%m%d-%H%M%S}', filters)
+        if not path:
+            return
+        sqlite_backup = '*.db' in selected
+        extension = '.db' if sqlite_backup else '.json'
+        if not path.lower().endswith(extension):
+            path += extension
+        operation = db_manager.create_backup if sqlite_backup else db_manager.export_backup
+        run_task(self, 'Yedek hazırlanıyor...', lambda: operation(path),
+                 lambda saved: QMessageBox.information(self, 'Yedek Kaydedildi',
+                     f'Yedek: {saved}\n\nBu dosya erişim şifreleri içerir. Güvenli bir yerde saklayın.'),
+                 self._storage_error)
+
+    def _import_inventory(self):
+        from inventory_io import read_document
+        path, _ = QFileDialog.getOpenFileName(self, 'Envanter İçe Aktar', '',
+                                               'ATLAS Yedeği (*.json *.db *.sqlite *.sqlite3);;Tüm Dosyalar (*)')
+        if not path:
+            return
+        run_task(self, 'Yedek doğrulanıyor...', lambda: read_document(path),
+                 self._preview_import, self._storage_error)
+
+    def _preview_import(self, document):
+        from storage_dialogs import ImportDialog
+        dialog = ImportDialog(document, self)
+        if not dialog.exec():
+            return
+        mode = dialog.mode.currentData()
+
+        def imported(result):
+            self._show_placeholder()
+            self._current_server = self._current_vm = self._current_parent = None
+            QMessageBox.information(self, 'İçe Aktarma Tamamlandı',
+                f"Eklenen: {result['servers_added']} sunucu, {result['vms_added']} VM\n"
+                f"Korunan: {result['servers_skipped']} sunucu, {result['vms_skipped']} VM\n\n"
+                f"Kurtarma yedeği: {result['backup_path']}")
+            self._load_data()
+
+        # Import the already reviewed document, without reopening a potentially changed file.
+        run_task(self, 'Envanter içe aktarılıyor...',
+                 lambda: db_manager.import_document(document, mode), imported, self._storage_error)
 
     def _populate_tree(self):
         self.tree.clear()
@@ -682,6 +761,8 @@ class MainWindow(QMainWindow):
     # ── Server Detail ─────────────────────────────────────────────────────────
 
     def _show_server(self, server):
+        self._current_server = server
+        self._current_vm = self._current_parent = None
         self._clear_detail()
         srv_type = server.get('type', 'Server')
         is_storage = srv_type == 'Storage'
@@ -767,6 +848,9 @@ class MainWindow(QMainWindow):
     # ── VM Detail ─────────────────────────────────────────────────────────────
 
     def _show_vm(self, vm, parent_server):
+        self._current_vm = vm
+        self._current_parent = parent_server
+        self._current_server = None
         self._clear_detail()
 
         pname = ''
@@ -887,35 +971,24 @@ class MainWindow(QMainWindow):
 
     # ── CRUD: Server ──────────────────────────────────────────────────────────
 
+    def _commit_change(self, operation):
+        def changed():
+            operation()
+            return db_manager.get_inventory()
+        run_task(self, 'Envanter kaydediliyor...', changed,
+                 self._data_loaded, self._storage_error)
+
     def _add_server(self):
         from dialogs import ServerDialog
         dlg = ServerDialog(parent=self)
         if dlg.exec():
-            try:
-                db_manager.add_server(dlg.result_data)
-                self._load_data()
-            except Exception as e:
-                QMessageBox.critical(self, "Hata", f"Sunucu eklenemedi:\n{e}")
+            self._commit_change(lambda: db_manager.add_server(dlg.result_data))
 
     def _edit_server(self, server):
         from dialogs import ServerDialog
         dlg = ServerDialog(server_data=server, parent=self)
         if dlg.exec():
-            try:
-                db_manager.update_server(server['id'], dlg.result_data)
-                self._load_data()
-                # Refresh detail if still showing this server
-                updated = db_manager.get_server(server['id'])
-                if updated:
-                    updated['vms'] = [vm for vm in db_manager.get_inventory()
-                                      if False]  # re-fetch from inventory
-                    # Just reload from full inventory
-                    for s in self.inventory:
-                        if s['id'] == server['id']:
-                            self._show_server(s)
-                            break
-            except Exception as e:
-                QMessageBox.critical(self, "Hata", f"Sunucu güncellenemedi:\n{e}")
+            self._commit_change(lambda: db_manager.update_server(server['id'], dlg.result_data))
 
     def _delete_server(self, server):
         alias = server.get('alias', server.get('name', ''))
@@ -926,9 +999,7 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(self, "Sunucu Sil", msg,
                                      QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
-            db_manager.delete_server(server['id'])
-            self._load_data()
-            self._show_placeholder()
+            self._commit_change(lambda: db_manager.delete_server(server['id']))
 
     # ── CRUD: VM ──────────────────────────────────────────────────────────────
 
@@ -937,28 +1008,14 @@ class MainWindow(QMainWindow):
         servers = [s for s in self.inventory if s.get('type') == 'Server']
         dlg = VMDialog(servers, preselect_server_id=preselect_server_id, parent=self)
         if dlg.exec():
-            try:
-                db_manager.add_vm(dlg.result_data)
-                self._load_data()
-            except Exception as e:
-                QMessageBox.critical(self, "Hata", f"VM eklenemedi:\n{e}")
+            self._commit_change(lambda: db_manager.add_vm(dlg.result_data))
 
     def _edit_vm(self, vm):
         from dialogs import VMDialog
         servers = [s for s in self.inventory if s.get('type') == 'Server']
         dlg = VMDialog(servers, vm_data=vm, parent=self)
         if dlg.exec():
-            try:
-                db_manager.update_vm(vm['id'], dlg.result_data)
-                self._load_data()
-                # Refresh detail for this VM
-                updated_vm = db_manager.get_vm(vm['id'])
-                if updated_vm:
-                    parent = next((s for s in self.inventory
-                                   if s['id'] == updated_vm.get('server_id')), None)
-                    self._show_vm(updated_vm, parent)
-            except Exception as e:
-                QMessageBox.critical(self, "Hata", f"VM güncellenemedi:\n{e}")
+            self._commit_change(lambda: db_manager.update_vm(vm['id'], dlg.result_data))
 
     def _delete_vm(self, vm):
         name = vm.get('name', f"VM {vm.get('vm_id','?')}")
@@ -966,9 +1023,7 @@ class MainWindow(QMainWindow):
                                      f"'{name}' VM'ini silmek istediğinize emin misiniz?",
                                      QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
-            db_manager.delete_vm(vm['id'])
-            self._load_data()
-            self._show_placeholder()
+            self._commit_change(lambda: db_manager.delete_vm(vm['id']))
 
     # ── About ─────────────────────────────────────────────────────────────────
 

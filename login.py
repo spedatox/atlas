@@ -10,7 +10,7 @@ class LoginWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("ATLAS — Giriş")
-        self.setFixedSize(420, 540)
+        self.setFixedSize(420, 610)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._drag_pos = None
@@ -105,7 +105,8 @@ class LoginWindow(QDialog):
         self.error_lbl = QLabel("")
         self.error_lbl.setObjectName("loginError")
         self.error_lbl.setAlignment(Qt.AlignCenter)
-        self.error_lbl.setFixedHeight(20)
+        self.error_lbl.setWordWrap(True)
+        self.error_lbl.setFixedHeight(44)
         lay.addWidget(self.error_lbl)
         lay.addSpacing(16)
 
@@ -116,6 +117,12 @@ class LoginWindow(QDialog):
         self.login_btn.setCursor(Qt.PointingHandCursor)
         self.login_btn.clicked.connect(self._try_login)
         lay.addWidget(self.login_btn)
+
+        source_btn = QPushButton('Veri Kaynağı / Uzak Sunucu')
+        source_btn.setObjectName('toggleBtn')
+        source_btn.clicked.connect(self._open_backend)
+        lay.addSpacing(10)
+        lay.addWidget(source_btn)
 
         lay.addStretch()
 
@@ -141,16 +148,27 @@ class LoginWindow(QDialog):
         close_btn.clicked.connect(self.reject)
 
     # ── Auth ──────────────────────────────────────────────────────────────────
+    def _open_backend(self):
+        from storage_dialogs import BackendDialog
+        from PySide6.QtWidgets import QMessageBox
+        try:
+            BackendDialog(self).exec()
+        except Exception as exc:
+            QMessageBox.critical(self, 'Veri Kaynağı Hatası', str(exc))
+
     def _try_login(self):
-        from database import db_manager
+        if not self.login_btn.isEnabled():
+            return
+        from backends import db_manager
+        from tasks import run_task
         username = self.username_input.text().strip()
         password = self.password_input.text()
 
         self.login_btn.setEnabled(False)
         self.login_btn.setText("Kontrol ediliyor...")
 
-        def check():
-            if db_manager.authenticate(username, password):
+        def checked(authenticated):
+            if authenticated:
                 self.accept()
             else:
                 self.error_lbl.setText("Hatalı kullanıcı adı veya şifre")
@@ -163,4 +181,10 @@ class LoginWindow(QDialog):
             self.login_btn.setEnabled(True)
             self.login_btn.setText("Giriş Yap")
 
-        QTimer.singleShot(150, check)
+        def failed(message):
+            self.error_lbl.setText(message)
+            self.login_btn.setEnabled(True)
+            self.login_btn.setText('Giriş Yap')
+
+        run_task(self, 'Giriş kontrol ediliyor...',
+                 lambda: db_manager.authenticate(username, password), checked, failed)

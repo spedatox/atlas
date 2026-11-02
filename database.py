@@ -1,6 +1,15 @@
 import sqlite3
 import os
 import hashlib
+import hmac
+import sys
+import tempfile
+from contextlib import closing
+from datetime import datetime
+from pathlib import Path
+
+from inventory_io import (SERVER_COLUMNS, VM_COLUMNS, make_document,
+                          validate_document, read_document, write_document)
 
 
 def _hash_pw(password: str) -> str:
@@ -8,14 +17,23 @@ def _hash_pw(password: str) -> str:
 
 
 class DatabaseManager:
-    def __init__(self):
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        self.db_path = os.path.join(current_dir, "inventory.db")
+    def __init__(self, db_path=None, seed=True, backup_dir=None, admin_password='atlas2024'):
+        current_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+        default_path = current_dir / 'inventory.db'
+        legacy_path = Path(__file__).parent / 'inventory.db'
+        if not db_path and not default_path.exists() and legacy_path.exists():
+            default_path = legacy_path
+        self.db_path = str(Path(db_path or default_path).resolve())
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.backup_dir = Path(backup_dir or Path(self.db_path).parent / 'backups').resolve()
+        self._seed = seed
+        self._admin_password = admin_password
         self._setup()
 
     def get_connection(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA foreign_keys=ON')
         return conn
 
     def _column_exists(self, conn, table, column):
@@ -29,32 +47,107 @@ class DatabaseManager:
         return c.fetchone() is not None
 
     def _setup(self):
-        conn = self.get_connection()
-        needs_migration = (
-            not self._table_exists(conn, 'servers') or
-            not self._column_exists(conn, 'servers', 'alias') or
-            not self._column_exists(conn, 'servers', 'cpu_model') or
-            not self._table_exists(conn, 'vms') or
-            not self._column_exists(conn, 'vms', 'status') or
-            not self._table_exists(conn, 'users')
-        )
-        conn.close()
-
-        if needs_migration:
-            print("Yeni şemaya geçiliyor...")
-            conn2 = self.get_connection()
-            c = conn2.cursor()
-            c.execute('DROP TABLE IF EXISTS vms')
-            c.execute('DROP TABLE IF EXISTS servers')
-            conn2.commit()
-            conn2.close()
-            self._create_tables()
+        with closing(self.get_connection()) as conn:
+            existing = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchone())
+        if existing:
+            # One consistent snapshot per day, before any schema changes.
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            daily = self.backup_dir / f"startup-{datetime.now():%Y-%m-%d}.db"
+            if not daily.exists():
+                self.create_backup(daily)
+        self._create_tables()
+        with closing(self.get_connection()) as conn, conn:
+            for table, columns in (('servers', SERVER_COLUMNS), ('vms', VM_COLUMNS)):
+                for column, definition in columns.items():
+                    if not self._column_exists(conn, table, column):
+                        if column in ('id', 'name', 'server_id'):
+                            raise ValueError(f'Desteklenmeyen eski şema: {table}.{column}')
+                        conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+        if not existing and self._seed:
             self._seed_data()
-        else:
-            # Ensure users table and default admin exist even without full migration
-            conn3 = self.get_connection()
-            self._ensure_users(conn3)
-            conn3.close()
+
+    def create_backup(self, destination=None):
+        if destination is None:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            destination = self.backup_dir / f"inventory-{datetime.now():%Y%m%d-%H%M%S-%f}.db"
+        destination = Path(destination).resolve()
+        self._check_destination(destination)
+        fd, temporary = tempfile.mkstemp(prefix='.atlas-', dir=destination.parent)
+        os.close(fd)
+        try:
+            with closing(self.get_connection()) as source, closing(sqlite3.connect(temporary)) as target:
+                source.backup(target)
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return str(destination)
+
+    def _check_destination(self, destination):
+        protected = [Path(self.db_path + suffix) for suffix in ('', '-wal', '-shm', '-journal')]
+        if any(destination == path or (destination.exists() and path.exists() and destination.samefile(path))
+               for path in protected):
+            raise ValueError('Etkin veritabanının üzerine yazılamaz.')
+
+    def export_document(self):
+        with closing(self.get_connection()) as conn, conn:
+            # Explicit transaction keeps both tables in the same read snapshot.
+            conn.execute('BEGIN')
+            servers = [dict(r) for r in conn.execute('SELECT * FROM servers ORDER BY id')]
+            vms = [dict(r) for r in conn.execute('SELECT * FROM vms ORDER BY id')]
+        return make_document(servers, vms)
+
+    def export_backup(self, destination):
+        self._check_destination(Path(destination).resolve())
+        write_document(destination, self.export_document())
+        return str(destination)
+
+    def import_file(self, source, mode='merge'):
+        return self.import_document(read_document(source), mode)
+
+    def import_document(self, document, mode='merge'):
+        document = validate_document(document)
+        if mode not in ('merge', 'replace'):
+            raise ValueError('İçe aktarma modu merge veya replace olmalı.')
+        counts = {'servers_added': 0, 'vms_added': 0, 'servers_skipped': 0, 'vms_skipped': 0}
+        with closing(self.get_connection()) as conn, conn:
+            # Block all writers, including other clients, until backup + import finish.
+            conn.execute('BEGIN IMMEDIATE')
+            backup = self.create_backup()
+            if mode == 'replace':
+                conn.execute('DELETE FROM vms')
+                conn.execute('DELETE FROM servers')
+            mapping = {}
+            for server in document['servers']:
+                found = conn.execute('SELECT id FROM servers WHERE name=?', (server['name'],)).fetchone()
+                if found:
+                    mapping[server['id']] = found['id']
+                    counts['servers_skipped'] += 1
+                else:
+                    mapping[server['id']] = self._insert_row(conn, 'servers', server)
+                    counts['servers_added'] += 1
+            for vm in document['vms']:
+                data = dict(vm, server_id=mapping[vm['server_id']])
+                if vm['vm_id'] is None:
+                    found = conn.execute('SELECT id FROM vms WHERE server_id=? AND vm_id IS NULL AND name=?',
+                                         (data['server_id'], vm['name'])).fetchone()
+                else:
+                    found = conn.execute('SELECT id FROM vms WHERE server_id=? AND vm_id=?',
+                                         (data['server_id'], vm['vm_id'])).fetchone()
+                if mode == 'merge' and found:
+                    counts['vms_skipped'] += 1
+                else:
+                    self._insert_row(conn, 'vms', data)
+                    counts['vms_added'] += 1
+        return dict(counts, backup_path=backup)
+
+    @staticmethod
+    def _insert_row(conn, table, data):
+        columns = SERVER_COLUMNS if table == 'servers' else VM_COLUMNS
+        fields = [field for field in columns if field != 'id']
+        cursor = conn.execute(f"INSERT INTO {table} ({','.join(fields)}) VALUES ({','.join('?' for _ in fields)})",
+                              [data.get(field) for field in fields])
+        return cursor.lastrowid
 
     def _create_tables(self):
         conn = self.get_connection()
@@ -120,8 +213,11 @@ class DatabaseManager:
         c.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL)")
         c.execute("SELECT COUNT(*) FROM users")
         if c.fetchone()[0] == 0:
+            if not self._admin_password:
+                conn.close()
+                raise ValueError('Yeni uzak veritabanı için ATLAS_ADMIN_PASSWORD gerekli.')
             c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                      ("admin", _hash_pw("atlas2024")))
+                      ("admin", _hash_pw(self._admin_password)))
         conn.commit()
 
     def authenticate(self, username: str, password: str) -> bool:
@@ -132,7 +228,7 @@ class DatabaseManager:
         conn.close()
         if not row:
             return False
-        return row['password_hash'] == _hash_pw(password)
+        return hmac.compare_digest(row['password_hash'], _hash_pw(password))
 
     # ─── Seed Data ────────────────────────────────────────────────────────────
 
@@ -311,6 +407,7 @@ class DatabaseManager:
 
     def get_inventory(self):
         conn = self.get_connection()
+        conn.execute('BEGIN')
         c = conn.cursor()
         c.execute('SELECT * FROM servers ORDER BY type DESC, alias')
         servers = [dict(row) for row in c.fetchall()]
@@ -339,76 +436,57 @@ class DatabaseManager:
 
     # ─── Create ───────────────────────────────────────────────────────────────
 
+    def _save(self, table, data, row_id=None):
+        columns = SERVER_COLUMNS if table == 'servers' else VM_COLUMNS
+        if not isinstance(data, dict) or set(data) - (set(columns) - {'id'}):
+            raise ValueError('Geçersiz kayıt alanları.')
+        with closing(self.get_connection()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if row_id is not None:
+                existing = conn.execute(f'SELECT * FROM {table} WHERE id=?', (row_id,)).fetchone()
+                if existing is None:
+                    raise LookupError('Kayıt bulunamadı; envanteri yenileyin.')
+                merged = {key: existing[key] for key in columns if key != 'id'}
+                merged.update(data)
+                data = merged
+            row = dict(data, id=1)
+            if table == 'servers':
+                validate_document(make_document([row], []))
+            else:
+                parent_id = data.get('server_id')
+                if type(parent_id) is not int or parent_id <= 0:
+                    raise ValueError('Geçerli bir sunucu seçin.')
+                validate_document(make_document([{'id': parent_id, 'name': 'parent'}], [row]))
+            fields = [f for f in columns if f != 'id']
+            data = dict(data)
+            if table == 'servers' and data.get('type') is None:
+                data['type'] = 'Server'
+            if row_id is None:
+                return self._insert_row(conn, table, data)
+            values = [data.get(f) for f in fields] + [row_id]
+            conn.execute(f"UPDATE {table} SET {', '.join(f'{f}=?' for f in fields)} WHERE id=?", values)
+
     def add_server(self, data: dict) -> int:
-        conn = self.get_connection()
-        c = conn.cursor()
-        fields = ['name', 'alias', 'ip_address', 'username', 'password', 'type', 'notes',
-                  'hostname', 'cpu_model', 'cpu_sockets', 'cpu_threads',
-                  'total_ram', 'system_disk', 'swap', 'kernel', 'pve_version', 'boot_mode', 'storage_pools']
-        vals = [data.get(f) for f in fields]
-        placeholders = ','.join(['?'] * len(fields))
-        col_names = ','.join(fields)
-        c.execute(f'INSERT INTO servers ({col_names}) VALUES ({placeholders})', vals)
-        new_id = c.lastrowid
-        conn.commit()
-        conn.close()
-        return new_id
+        return self._save('servers', data)
 
     def add_vm(self, data: dict) -> int:
-        conn = self.get_connection()
-        c = conn.cursor()
-        fields = ['server_id', 'vm_id', 'name', 'ip_address', 'username', 'password',
-                  'ram_gb', 'cores', 'disk_info', 'notes', 'status', 'nic_info', 'bios_type', 'machine_type']
-        vals = [data.get(f) for f in fields]
-        placeholders = ','.join(['?'] * len(fields))
-        col_names = ','.join(fields)
-        c.execute(f'INSERT INTO vms ({col_names}) VALUES ({placeholders})', vals)
-        new_id = c.lastrowid
-        conn.commit()
-        conn.close()
-        return new_id
-
-    # ─── Update ───────────────────────────────────────────────────────────────
+        return self._save('vms', data)
 
     def update_server(self, server_id: int, data: dict):
-        conn = self.get_connection()
-        c = conn.cursor()
-        fields = ['name', 'alias', 'ip_address', 'username', 'password', 'type', 'notes',
-                  'hostname', 'cpu_model', 'cpu_sockets', 'cpu_threads',
-                  'total_ram', 'system_disk', 'swap', 'kernel', 'pve_version', 'boot_mode', 'storage_pools']
-        set_clause = ', '.join(f'{f}=?' for f in fields)
-        vals = [data.get(f) for f in fields] + [server_id]
-        c.execute(f'UPDATE servers SET {set_clause} WHERE id=?', vals)
-        conn.commit()
-        conn.close()
+        self._save('servers', data, server_id)
 
     def update_vm(self, vm_db_id: int, data: dict):
-        conn = self.get_connection()
-        c = conn.cursor()
-        fields = ['server_id', 'vm_id', 'name', 'ip_address', 'username', 'password',
-                  'ram_gb', 'cores', 'disk_info', 'notes', 'status', 'nic_info', 'bios_type', 'machine_type']
-        set_clause = ', '.join(f'{f}=?' for f in fields)
-        vals = [data.get(f) for f in fields] + [vm_db_id]
-        c.execute(f'UPDATE vms SET {set_clause} WHERE id=?', vals)
-        conn.commit()
-        conn.close()
-
-    # ─── Delete ───────────────────────────────────────────────────────────────
+        self._save('vms', data, vm_db_id)
 
     def delete_server(self, server_id: int):
-        conn = self.get_connection()
-        c = conn.cursor()
-        c.execute('DELETE FROM vms WHERE server_id=?', (server_id,))
-        c.execute('DELETE FROM servers WHERE id=?', (server_id,))
-        conn.commit()
-        conn.close()
+        with closing(self.get_connection()) as conn, conn:
+            conn.execute('DELETE FROM vms WHERE server_id=?', (server_id,))
+            cursor = conn.execute('DELETE FROM servers WHERE id=?', (server_id,))
+            if not cursor.rowcount:
+                raise LookupError('Kayıt bulunamadı; envanteri yenileyin.')
 
     def delete_vm(self, vm_db_id: int):
-        conn = self.get_connection()
-        c = conn.cursor()
-        c.execute('DELETE FROM vms WHERE id=?', (vm_db_id,))
-        conn.commit()
-        conn.close()
-
-
-db_manager = DatabaseManager()
+        with closing(self.get_connection()) as conn, conn:
+            cursor = conn.execute('DELETE FROM vms WHERE id=?', (vm_db_id,))
+            if not cursor.rowcount:
+                raise LookupError('Kayıt bulunamadı; envanteri yenileyin.')

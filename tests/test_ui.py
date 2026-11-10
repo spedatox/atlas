@@ -7,12 +7,12 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 try:
-    from PySide6.QtCore import QThreadPool, Qt
+    from PySide6.QtCore import QCoreApplication, QEvent, QThreadPool
     from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
+    from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QPushButton
 except ImportError:
     QApplication = None
 
@@ -40,6 +40,7 @@ class DesktopTests(unittest.TestCase):
         self.addCleanup(self.environment.stop)
         self.errors = []
         self.messages = []
+        self.widgets = []
         for name, values in (('critical', self.errors), ('information', self.messages)):
             mock = patch.object(QMessageBox, name, side_effect=lambda *args, values=values: values.append(args[2]))
             mock.start()
@@ -55,15 +56,20 @@ class DesktopTests(unittest.TestCase):
         self.fail(f'UI operation did not finish. Errors: {self.errors}')
 
     def tearDown(self):
-        QThreadPool.globalInstance().waitForDone(5000)
-        for widget in QApplication.topLevelWidgets():
+        self.assertTrue(QThreadPool.globalInstance().waitForDone(5000))
+        for widget in reversed(self.widgets):
             widget.close()
-        self.app.processEvents()
+            widget.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.assertEqual(self.errors, [])
+
+    def keep_widget(self, widget):
+        self.widgets.append(widget)
+        return widget
 
     def window(self):
         from ui_main import MainWindow
-        window = MainWindow()
+        window = self.keep_widget(MainWindow())
         window.show()
         self.wait_until(lambda: len(window.inventory) == 1)
         return window
@@ -71,12 +77,12 @@ class DesktopTests(unittest.TestCase):
     def test_login_and_connection_dialog(self):
         from login import LoginWindow
         from storage_dialogs import BackendDialog
-        login = LoginWindow()
+        login = self.keep_widget(LoginWindow())
         login.show()
         login.password_input.setText('atlas2024')
         login._try_login()
         self.wait_until(lambda: login.result() == QDialog.Accepted)
-        dialog = BackendDialog()
+        dialog = self.keep_widget(BackendDialog())
         self.assertFalse(dialog.url.isEnabled())
         dialog.mode.setCurrentIndex(1)
         self.assertTrue(dialog.url.isEnabled())
@@ -114,6 +120,43 @@ class DesktopTests(unittest.TestCase):
         self.wait_until(lambda: not window.inventory)
         self.assertIsNone(window._current_server)
 
+    def test_edit_server_profile_then_launch_from_details(self):
+        from dialogs import ServerDialog
+        from server_profiles import read_details
+        window = self.window()
+        server = window.inventory[0]
+        dialog = ServerDialog(server, window, open_ssh=True)
+        self.assertIs(dialog.tabs.currentWidget(), dialog.ssh_editor)
+        details = dialog.details_editor
+        details.category.setCurrentText('Donanım')
+        details.template.setCurrentText('ECC')
+        details._add_template()
+        details.table.cellWidget(0, 2).setText('Enabled')
+        ssh = dialog.ssh_editor
+        ssh.auth.setCurrentIndex(ssh.auth.findData('password'))
+        ssh.host.setText('test-node.example.net')
+        ssh.port.setValue(2222)
+        ssh.user.setText('operator')
+        ssh.password.setText('ssh-test-only')
+        ssh.fingerprint.setText('SHA256:' + 'a' * 43)
+        with patch.object(QMessageBox, 'warning', side_effect=AssertionError('Unexpected validation error')):
+            dialog._save()
+        self.assertEqual(dialog.result(), QDialog.Accepted)
+        window._commit_change(lambda: self.db.update_server(server['id'], dialog.result_data))
+        self.wait_until(lambda: window.inventory[0].get('ssh_host') == 'test-node.example.net')
+        saved = window.inventory[0]
+        self.assertEqual(read_details(saved['details_json'])[0]['label'], 'ECC')
+        self.assertEqual(saved['password'], 'test-only')
+        window._show_server(saved)
+        button = next(btn for btn in window.findChildren(QPushButton) if btn.text() == 'SSH Bağlan')
+        with patch('ssh_terminal.launch_ssh', return_value=Mock(poll=Mock(return_value=None))) as launch:
+            button.click()
+        launch.assert_called_once()
+        profile, parent = launch.call_args.args
+        self.assertEqual((profile.host, profile.port, profile.username), ('test-node.example.net', 2222, 'operator'))
+        self.assertEqual(profile.password, 'ssh-test-only')
+        self.assertIs(parent, window)
+
     def test_remote_login_and_inventory_in_desktop(self):
         from backends import db_manager, RemoteBackend
         from login import LoginWindow
@@ -124,7 +167,7 @@ class DesktopTests(unittest.TestCase):
         try:
             db_manager._backend = RemoteBackend(f'http://127.0.0.1:{server.server_port}', server.token)
             db_manager.mode = 'remote'
-            login = LoginWindow()
+            login = self.keep_widget(LoginWindow())
             login.show()
             login.password_input.setText('atlas2024')
             login._try_login()

@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows Installer
 
 on:
   push:
@@ -18,18 +18,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install PySide6==6.6.3 pyinstaller==6.5.0
-
-      - name: Build EXE
-        run: |
-          python -m PyInstaller atlas.spec --noconfirm
+      - name: Build Windows setup
+        shell: powershell
+        run: .\build_windows.ps1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ATLAS-Windows
-          path: dist/ATLAS/
+          name: ATLAS-Windows-x64-Setup
+          path: dist/ATLAS-Setup-x64.exe
+          if-no-files-found: error
           retention-days: 30

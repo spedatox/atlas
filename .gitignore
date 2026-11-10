@@ -6,6 +6,7 @@ dist/
 *.db
 venv/
 .venv/
+plink.exe
 backups/
 *.db-*
 *.sqlite

@@ -2,10 +2,12 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QTextEdit, QComboBox, QSpinBox,
     QDoubleSpinBox, QPushButton, QFrame, QScrollArea,
-    QWidget, QMessageBox
+    QWidget, QMessageBox, QTabWidget
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
+from server_edit_tabs import ServerDetailsEditor, SshProfileEditor
+from server_profiles import SSH_COLUMNS
 
 
 def _section_title(text):
@@ -90,14 +92,16 @@ def _spin(value=None, min_val=0, max_val=9999):
 class ServerDialog(QDialog):
     """Add or Edit a server/storage device."""
 
-    def __init__(self, server_data=None, parent=None):
+    def __init__(self, server_data=None, parent=None, *, open_ssh=False):
         super().__init__(parent)
         self._data = server_data or {}
         is_edit = bool(server_data)
         self.setWindowTitle("Sunucu Düzenle" if is_edit else "Yeni Sunucu Ekle")
-        self.setMinimumWidth(560)
-        self.setMaximumHeight(700)
+        self.setMinimumSize(660, 450)
+        self.resize(750, 650)
         self._init_ui()
+        if open_ssh:
+            self.tabs.setCurrentWidget(self.ssh_editor)
         self.setObjectName("atlasDialog")
 
     def _init_ui(self):
@@ -137,12 +141,12 @@ class ServerDialog(QDialog):
         body_lay.addSpacing(4)
 
         self.f_alias = _line("Sunucu 1", d.get('alias', ''))
-        self.f_name = _line("10.10.1.249", d.get('name', ''))
-        self.f_ip = _line("10.10.1.249:8006", d.get('ip_address', ''))
+        self.f_name = _line("sunucu.example.net", d.get('name', ''))
+        self.f_ip = _line("sunucu.example.net:8006", d.get('ip_address', ''))
         self.f_type = _combo(['Server', 'Storage'], d.get('type', 'Server'))
 
         body_lay.addWidget(_FormField("Ad / Takma Ad", self.f_alias))
-        body_lay.addWidget(_FormField("Base IP", self.f_name))
+        body_lay.addWidget(_FormField("Sunucu Kimliği / IP", self.f_name))
         body_lay.addWidget(_FormField("Erişim IP:Port", self.f_ip))
         body_lay.addWidget(_FormField("Tür", self.f_type))
 
@@ -169,9 +173,17 @@ class ServerDialog(QDialog):
 
         self.f_hostname = _line("ostim", d.get('hostname', ''))
         self.f_cpu_model = _line("Intel Xeon Silver 4210", d.get('cpu_model', ''))
+        self.f_cpu_info = _line("İşlemci bilgisi", d.get('cpu_info', ''))
         self.f_cpu_sockets = _spin(d.get('cpu_sockets'), 0, 64)
         self.f_cpu_threads = _spin(d.get('cpu_threads'), 0, 1024)
         self.f_total_ram = _line("125.54 GiB", d.get('total_ram', ''))
+        self.f_ram_gb = QDoubleSpinBox()
+        self.f_ram_gb.setObjectName('dlgSpin')
+        self.f_ram_gb.setRange(0, 1_000_000)
+        self.f_ram_gb.setDecimals(3)
+        self.f_ram_gb.setSpecialValueText('Belirtilmedi')
+        self.f_ram_gb.setValue(d.get('ram_gb') or 0)
+        self._initial_ram_gb = self.f_ram_gb.value()
         self.f_sys_disk = _line("93.99 GiB", d.get('system_disk', ''))
         self.f_swap = _line("8.00 GiB", d.get('swap', ''))
         self.f_kernel = _line("Linux 6.8.4-2-pve", d.get('kernel', ''))
@@ -181,9 +193,11 @@ class ServerDialog(QDialog):
 
         body_lay.addWidget(_FormField("Hostname", self.f_hostname))
         body_lay.addWidget(_FormField("CPU Modeli", self.f_cpu_model))
+        body_lay.addWidget(_FormField("CPU Bilgisi", self.f_cpu_info))
         body_lay.addWidget(_FormField("CPU Soket", self.f_cpu_sockets))
         body_lay.addWidget(_FormField("CPU Thread", self.f_cpu_threads))
         body_lay.addWidget(_FormField("Toplam RAM", self.f_total_ram))
+        body_lay.addWidget(_FormField("RAM (GB)", self.f_ram_gb))
         body_lay.addWidget(_FormField("Sistem Diski", self.f_sys_disk))
         body_lay.addWidget(_FormField("Swap", self.f_swap))
         body_lay.addWidget(_FormField("Kernel", self.f_kernel))
@@ -203,7 +217,14 @@ class ServerDialog(QDialog):
 
         body_lay.addStretch()
         scroll.setWidget(body)
-        root.addWidget(scroll, 1)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(scroll, 'Genel')
+        self.details_editor = ServerDetailsEditor(d)
+        self.tabs.addTab(self.details_editor, 'Ayrıntılar')
+        self.ssh_editor = SshProfileEditor(d)
+        self.tabs.addTab(self.ssh_editor, 'SSH')
+        self.tabs.currentChanged.connect(self._prefill_ssh)
+        root.addWidget(self.tabs, 1)
 
         # Footer buttons
         btn_frame = QFrame()
@@ -231,14 +252,34 @@ class ServerDialog(QDialog):
         btn_lay.addWidget(save_btn)
         root.addWidget(btn_frame)
 
+    def _prefill_ssh(self, index):
+        if self.tabs.widget(index) is self.ssh_editor:
+            self.ssh_editor.suggest_defaults({'name': self.f_name.text(), 'ip_address': self.f_ip.text(),
+                                              'hostname': self.f_hostname.text(), 'username': self.f_user.text()})
+
     def _save(self):
         name = self.f_name.text().strip()
         alias = self.f_alias.text().strip()
         if not name:
-            QMessageBox.warning(self, "Hata", "Base IP alanı zorunludur.")
+            self.tabs.setCurrentIndex(0)
+            QMessageBox.warning(self, "Hata", "Sunucu kimliği / IP alanı zorunludur.")
             return
         if not alias:
+            self.tabs.setCurrentIndex(0)
             QMessageBox.warning(self, "Hata", "Ad / Takma Ad alanı zorunludur.")
+            return
+
+        try:
+            details = self.details_editor.serialized()
+        except ValueError as error:
+            self.tabs.setCurrentWidget(self.details_editor)
+            QMessageBox.warning(self, 'Sunucu Ayrıntıları', str(error))
+            return
+        try:
+            ssh = self.ssh_editor.values()
+        except ValueError as error:
+            self.tabs.setCurrentWidget(self.ssh_editor)
+            QMessageBox.warning(self, 'SSH Ayarları', str(error))
             return
 
         boot_val = self.f_boot.currentText() or None
@@ -253,6 +294,7 @@ class ServerDialog(QDialog):
             'notes': self.f_notes.toPlainText().strip() or None,
             'hostname': self.f_hostname.text().strip() or None,
             'cpu_model': self.f_cpu_model.text().strip() or None,
+            'cpu_info': self.f_cpu_info.text().strip() or None,
             'cpu_sockets': self.f_cpu_sockets.value() or None,
             'cpu_threads': self.f_cpu_threads.value() or None,
             'total_ram': self.f_total_ram.text().strip() or None,
@@ -263,6 +305,12 @@ class ServerDialog(QDialog):
             'boot_mode': boot_val,
             'storage_pools': self.f_pools.text().strip() or None,
         }
+        if self.f_ram_gb.value() != self._initial_ram_gb:
+            self.result_data['ram_gb'] = self.f_ram_gb.value() or None
+        if details is not None or self._data.get('details_json') is not None:
+            self.result_data['details_json'] = details
+        if ssh['ssh_auth'] is not None or any(self._data.get(key) is not None for key in SSH_COLUMNS):
+            self.result_data.update(ssh)
         self.accept()
 
 

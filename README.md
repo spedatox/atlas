@@ -27,6 +27,8 @@
 - **Memory / Inventory Backup** — Portable JSON export or a complete local SQLite snapshot, plus automatic daily startup snapshots
 - **Import** — Preview and validate JSON/SQLite backups, merge without overwriting existing records, or replace inventory with an automatic recovery copy
 - **Remote Backend** — Share inventory through an authenticated HTTP API, with HTTPS required for remote hosts
+- **Server Details** — Categorized templates and custom fields for any server or storage device
+- **SSH Console** — Open a Windows console with a saved host, port, user, and SSH authentication profile
 
 ---
 
@@ -74,6 +76,17 @@ pip install PySide6
 # Run
 python main.py
 ```
+
+## Server details and SSH
+
+Open **Düzenle** on a server or storage device. **Genel** contains the existing inventory and hardware fields. In **Ayrıntılar**, add fields from the identity, hardware, storage, network, software, management, backup, and lifecycle categories. **Özel alan** accepts your own labels and categories, such as `Disk 2 / Seri numarası` or `NIC 3 / Switch portu`. Mark a field **Gizli** to mask its value in the editor and detail view. Search matches details by category, label, and visible value.
+
+Use **SSH Ayarla…** or the editor’s **SSH** tab. Check the suggested host and username, set the SSH port, and choose an authentication mode.
+
+- **Plink · kayıtlı parola** signs in with the saved SSH password. The Windows installer includes Plink. When running from source, install [PuTTY](https://www.chiark.greenend.org.uk/~sgtatham/putty/latest.html) or place its `plink.exe` beside `main.py`. Save the target’s verified `SHA256:…` SSH host-key fingerprint. Obtain it through a trusted channel, for example by running `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` from a trusted Linux server console. ATLAS gives Plink the password through a one-use, same-user Windows named pipe. A host-key mismatch stops the connection before authentication.
+- **OpenSSH · anahtar / etkileşimli giriş** uses Windows OpenSSH. Choose an optional local private key path or use your normal SSH configuration and agent. The console handles any password, passphrase, or first-connection verification prompt.
+
+Save the profile and click **SSH Bağlan** in the server details or context menu. ATLAS opens the SSH client in an interactive Windows console. SSH settings belong to the inventory record, so they work in local and remote mode and travel with inventory backups. Upgrade both the desktop and remote backend to use the new fields. SSH credentials and masked details use the existing unencrypted inventory storage. Backups contain those values, while private key file contents stay on the local machine.
 
 ## Memory backups and import
 
@@ -159,17 +172,21 @@ python -m unittest discover -s tests -v
 
 Storage and API tests use temporary databases and an actual loopback HTTP server. Qt tests run headlessly when PySide6 is installed, covering login, local/remote loading, backup menus, import preview, and detail refresh. They skip when Qt is unavailable. No tests access production inventory.
 
-### Windows EXE (build from source)
+### Windows installer
+
+Run `ATLAS-Setup-x64.exe` on Windows 10 (1809 or newer) or Windows 11 x64. Setup installs for the current user and adds a Start menu shortcut. It bundles the Python and Qt runtimes and Plink. Inventory files and backups created by ATLAS remain on disk after uninstall.
+
+Build the installer on Windows with x64 Python 3.11 or newer:
 
 ```bat
-# On a Windows machine with Python 3.10+ installed:
 build_windows.bat
-# Output: dist\ATLAS\ATLAS.exe
 ```
 
-### Windows EXE (via GitHub Actions)
+The output is `dist/ATLAS-Setup-x64.exe`. The build downloads checksum-verified copies of Inno Setup and Plink. Use `build_windows.bat -Python .venv\Scripts\python.exe` to build in an existing virtual environment.
 
-Push to GitHub — the workflow at `.github/workflows/build-windows.yml` automatically builds the `.exe` and makes it available as a downloadable artifact under the **Actions** tab.
+### Windows installer via GitHub Actions
+
+The **Build Windows Installer** workflow publishes the setup executable as the `ATLAS-Windows-x64-Setup` artifact under **Actions**.
 
 ---
 

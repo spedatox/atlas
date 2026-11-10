@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, QRect, QSize, QTimer
 from PySide6.QtGui import (QPainter, QFont, QColor, QFontMetrics,
                             QPen, QShortcut, QKeySequence, QAction)
 from backends import db_manager
+from server_profiles import SshProfile, read_details
 from tasks import run_task
 
 
@@ -171,6 +172,7 @@ class PasswordWidget(QWidget):
         lay.setSpacing(6)
 
         self._lbl = QLabel('●' * min(len(self._pw), 16))
+        self._lbl.setTextFormat(Qt.PlainText)
         self._lbl.setObjectName("pwMasked")
 
         self._eye = QPushButton("Göster")
@@ -207,12 +209,15 @@ class FieldRow(QWidget):
         lay.setSpacing(8)
 
         lbl = QLabel(label)
+        lbl.setTextFormat(Qt.PlainText)
+        lbl.setWordWrap(True)
         lbl.setObjectName("fieldLabel")
         lbl.setFixedWidth(130)
         lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         val_text = str(value) if value is not None else "—"
         val = QLabel(val_text)
+        val.setTextFormat(Qt.PlainText)
         val.setObjectName("fieldValue")
         val.setWordWrap(True)
         val.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -235,6 +240,7 @@ class DetailSection(QFrame):
         main.setSpacing(0)
 
         title_lbl = QLabel(title)
+        title_lbl.setTextFormat(Qt.PlainText)
         title_lbl.setObjectName("sectionTitle")
         main.addWidget(title_lbl)
 
@@ -258,6 +264,8 @@ class DetailSection(QFrame):
         rl.setSpacing(8)
 
         lbl = QLabel(label)
+        lbl.setTextFormat(Qt.PlainText)
+        lbl.setWordWrap(True)
         lbl.setObjectName("fieldLabel")
         lbl.setFixedWidth(130)
         lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -589,7 +597,7 @@ class MainWindow(QMainWindow):
         self.tree.expandAll()
 
     def _filter_tree(self, text):
-        q = text.lower().strip()
+        q = text.casefold().strip()
         root = self.tree.invisibleRootItem()
         for i in range(root.childCount()):
             grp = root.child(i)
@@ -599,7 +607,16 @@ class MainWindow(QMainWindow):
                 srv_item = grp.child(j)
                 d = srv_item.data(0, Qt.UserRole)
                 srv = d['data'] if d else {}
-                srv_match = not q or q in srv.get('name', '').lower() or q in srv.get('alias', '').lower()
+                srv_match = not q or any(q in (srv.get(key) or '').casefold() for key in
+                                         ('name', 'alias', 'hostname', 'ip_address', 'ssh_host'))
+                if not srv_match:
+                    for detail in read_details(srv.get('details_json')):
+                        values = [detail['category'], detail['label']]
+                        if not detail['secret']:
+                            values.append(detail['value'])
+                        if any(q in value.casefold() for value in values):
+                            srv_match = True
+                            break
                 child_match = False
                 for k in range(srv_item.childCount()):
                     vm_item = srv_item.child(k)
@@ -650,13 +667,16 @@ class MainWindow(QMainWindow):
         menu.setObjectName("contextMenu")
 
         if data['node_type'] == 'server':
+            ssh_act = menu.addAction('SSH Bağlan' if data['data'].get('ssh_auth') else 'SSH Ayarla…')
             edit_act = menu.addAction("Düzenle")
             add_vm_act = menu.addAction("VM Ekle")
             menu.addSeparator()
             del_act = menu.addAction("Sil")
 
             action = menu.exec(self.tree.viewport().mapToGlobal(pos))
-            if action == edit_act:
+            if action == ssh_act:
+                self._connect_ssh(data['data'])
+            elif action == edit_act:
                 self._edit_server(data['data'])
             elif action == add_vm_act:
                 self._add_vm(preselect_server_id=data['data'].get('id'))
@@ -780,11 +800,11 @@ class MainWindow(QMainWindow):
 
         # Connection section
         conn = DetailSection("Bağlantı Bilgileri")
-        ip_addr = server.get('ip_address', server.get('name', ''))
+        ip_addr = server.get('ip_address') or server.get('name', '')
 
         if not is_storage:
-            url = f"https://{ip_addr}"
-            conn.add_field("Proxmox URL", url, copyable=True)
+            url = ip_addr if '://' in ip_addr else f'https://{ip_addr}'
+            conn.add_field('Yönetim Adresi', url, copyable=True)
         else:
             conn.add_field("IP Adresi", ip_addr, copyable=True)
 
@@ -802,14 +822,30 @@ class MainWindow(QMainWindow):
 
         self.detail_layout.addWidget(conn)
 
+        ssh = DetailSection('SSH Bağlantısı')
+        if server.get('ssh_auth'):
+            ssh.add_field('SSH sunucusu', server['ssh_host'], copyable=True)
+            ssh.add_field('Port / kullanıcı', f"{server['ssh_port']} · {server['ssh_username']}")
+            ssh.add_field('Kimlik doğrulama', 'Kayıtlı parola' if server['ssh_auth'] == 'password' else 'OpenSSH')
+        ssh_btn = QPushButton('SSH Bağlan' if server.get('ssh_auth') else 'SSH Ayarla…')
+        ssh_btn.setObjectName('actionAddBtn')
+        ssh_btn.setMinimumHeight(30)
+        ssh_btn.clicked.connect(lambda: self._connect_ssh(server))
+        ssh.add_widget(ssh_btn)
+        self.detail_layout.addWidget(ssh)
+
         # Physical resources section (servers only)
         if not is_storage and any(server.get(k) for k in
-                                   ('cpu_model', 'cpu_threads', 'total_ram', 'kernel')):
+                                   ('hostname', 'cpu_model', 'cpu_info', 'cpu_sockets', 'cpu_threads',
+                                    'total_ram', 'ram_gb', 'system_disk', 'swap', 'kernel',
+                                    'pve_version', 'boot_mode', 'storage_pools')):
             res = DetailSection("Sistem Kaynakları")
             if server.get('hostname'):
                 res.add_field("Hostname", server['hostname'])
             if server.get('cpu_model'):
                 res.add_field("CPU Modeli", server['cpu_model'])
+            if server.get('cpu_info'):
+                res.add_field('CPU Bilgisi', server['cpu_info'])
 
             cpu_line = []
             if server.get('cpu_sockets'):
@@ -821,6 +857,8 @@ class MainWindow(QMainWindow):
 
             if server.get('total_ram'):
                 res.add_field("Toplam RAM", server['total_ram'])
+            if server.get('ram_gb'):
+                res.add_field('RAM (GB)', server['ram_gb'])
             if server.get('system_disk'):
                 res.add_field("Sistem Diski", server['system_disk'])
             if server.get('swap') and server['swap'] != 'N/A':
@@ -835,6 +873,18 @@ class MainWindow(QMainWindow):
                 res.add_field("Depolama Havuzları", server['storage_pools'])
             self.detail_layout.addWidget(res)
 
+        sections = {}
+        for field in read_details(server.get('details_json')):
+            category = field['category']
+            if category not in sections:
+                sections[category] = DetailSection(category)
+                self.detail_layout.addWidget(sections[category])
+            section = sections[category]
+            if field['secret']:
+                section.add_password(field['label'], field['value'])
+            else:
+                section.add_field(field['label'], field['value'], copyable=True)
+
         # VMs section
         vms = server.get('vms', [])
         if vms:
@@ -844,6 +894,31 @@ class MainWindow(QMainWindow):
             self.detail_layout.addWidget(vm_sec)
 
         self.detail_layout.addStretch()
+
+    def _connect_ssh(self, server):
+        from ssh_terminal import launch_ssh
+        try:
+            profile = SshProfile.from_record(server)
+            if profile is None:
+                self._edit_server(server, open_ssh=True)
+                return
+            process = launch_ssh(profile, self)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, 'SSH Bağlantısı', str(error))
+            return
+
+        self._status.showMessage(f'SSH konsolu açıldı · {profile.host}:{profile.port}', 5000)
+
+        def check_start():
+            status = process.poll()
+            if status not in (None, 0):
+                self._status.showMessage(f'SSH istemcisi erken kapandı (kod {status}). Bağlantı ayarlarını kontrol edin.', 10000)
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(check_start)
+        timer.timeout.connect(timer.deleteLater)
+        timer.start(2500)
 
     # ── VM Detail ─────────────────────────────────────────────────────────────
 
@@ -984,9 +1059,9 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self._commit_change(lambda: db_manager.add_server(dlg.result_data))
 
-    def _edit_server(self, server):
+    def _edit_server(self, server, *, open_ssh=False):
         from dialogs import ServerDialog
-        dlg = ServerDialog(server_data=server, parent=self)
+        dlg = ServerDialog(server_data=server, parent=self, open_ssh=open_ssh)
         if dlg.exec():
             self._commit_change(lambda: db_manager.update_server(server['id'], dlg.result_data))
 

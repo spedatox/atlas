@@ -238,6 +238,27 @@ class RemoteTests(unittest.TestCase):
         self.assertTrue(Path(self.client.create_backup()).exists())
         self.assertTrue(self.db.authenticate('admin', 'private-test'))
 
+    def test_server_details_and_ssh_survive_remote_edit_and_backup_restore(self):
+        self.login()
+        fields = {
+            'details_json': json.dumps([{'category': 'Disk 2', 'label': 'Seri numarası',
+                                         'value': 'test-disk', 'secret': False}]),
+            'ssh_auth': 'password', 'ssh_host': 'node.example.net', 'ssh_port': 2222,
+            'ssh_username': 'operator', 'ssh_password': 'ssh-test-only',
+            'ssh_fingerprint': 'SHA256:' + 'a' * 43,
+        }
+        sid = self.client.add_server({'name': 'profile-test', 'password': 'web-test-only', **fields})
+        self.client.update_server(sid, {'alias': 'Changed'})
+        with self.assertRaises(BackendError):
+            self.client.update_server(sid, {'ssh_fingerprint': ''})
+        path = self.root / 'profile-backup.json'
+        self.client.export_backup(path)
+        restored = DatabaseManager(self.root / 'restored.db', seed=False)
+        restored.import_file(path, 'replace')
+        for row in (self.client.get_server(sid), restored.get_inventory()[0]):
+            self.assertEqual({key: row[key] for key in fields}, fields)
+            self.assertEqual(row['password'], 'web-test-only')
+
     def test_bad_requests_missing_records_and_integrity_errors(self):
         self.login()
         with self.assertRaises(BackendError):

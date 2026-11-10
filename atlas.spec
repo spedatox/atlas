@@ -1,10 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # ATLAS — PyInstaller spec file
 
-import sys
 from pathlib import Path
-
-block_cipher = None
 
 a = Analysis(
     ['main.py'],
@@ -13,26 +10,7 @@ a = Analysis(
     datas=[
         ('styles.qss', '.'),
     ],
-    hiddenimports=[
-        'PySide6.QtCore',
-        'PySide6.QtGui',
-        'PySide6.QtWidgets',
-        'PySide6.QtSvg',
-        'PySide6.QtSvgWidgets',
-        'PySide6.QtXml',
-        'PySide6.QtNetwork',
-        'PySide6.QtPrintSupport',
-        'database',
-        'backends',
-        'inventory_io',
-        'storage_dialogs',
-        'tasks',
-        'login',
-        'dialogs',
-        'ui_main',
-        'sqlite3',
-        'hashlib',
-    ],
+    hiddenimports=['PySide6.QtSvg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -40,13 +18,10 @@ a = Analysis(
         'matplotlib', 'numpy', 'scipy', 'PIL', 'tkinter',
         'PyQt5', 'PyQt6', 'wx',
     ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
@@ -57,7 +32,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,        # No console window
     disable_windowed_traceback=False,
     target_arch=None,
@@ -70,10 +45,8 @@ exe = EXE(
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
-    upx_exclude=[],
+    upx=False,
     name='ATLAS',
 )

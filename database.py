@@ -57,6 +57,7 @@ class DatabaseManager:
                 self.create_backup(daily)
         self._create_tables()
         with closing(self.get_connection()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
             for table, columns in (('servers', SERVER_COLUMNS), ('vms', VM_COLUMNS)):
                 for column, definition in columns.items():
                     if not self._column_exists(conn, table, column):

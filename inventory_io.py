@@ -7,6 +7,7 @@ import tempfile
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from server_profiles import SSH_COLUMNS, SshProfile, read_details
 
 SERVER_COLUMNS = {
     'id': 'INTEGER', 'name': 'TEXT', 'alias': 'TEXT', 'ip_address': 'TEXT',
@@ -15,6 +16,7 @@ SERVER_COLUMNS = {
     'cpu_model': 'TEXT', 'cpu_sockets': 'INTEGER', 'cpu_threads': 'INTEGER',
     'total_ram': 'TEXT', 'system_disk': 'TEXT', 'swap': 'TEXT', 'kernel': 'TEXT',
     'pve_version': 'TEXT', 'boot_mode': 'TEXT', 'storage_pools': 'TEXT',
+    'details_json': 'TEXT', **SSH_COLUMNS,
 }
 VM_COLUMNS = {
     'id': 'INTEGER', 'server_id': 'INTEGER', 'vm_id': 'INTEGER', 'name': 'TEXT',
@@ -65,8 +67,11 @@ def validate_document(document):
                     if sql_type == 'REAL' and (type(value) not in (int, float) or not math.isfinite(value)):
                         raise ValueError(f'Sayı bekleniyor: {table}.{key}')
                 clean[key] = value
-            if table == 'servers' and clean['type'] not in ('Server', 'Storage'):
-                raise ValueError('Bilinmeyen sunucu türü.')
+            if table == 'servers':
+                if clean['type'] not in ('Server', 'Storage'):
+                    raise ValueError('Bilinmeyen sunucu türü.')
+                read_details(clean['details_json'])
+                SshProfile.from_record(clean)
             normalized[table].append(clean)
     server_ids = {s['id'] for s in normalized['servers']}
     names = [s['name'] for s in normalized['servers']]
